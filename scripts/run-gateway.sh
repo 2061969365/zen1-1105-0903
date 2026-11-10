@@ -18,7 +18,6 @@ PORT="${PORT:-8081}"
 PROBE_MODEL="${PROBE_MODEL:-deepseek-v4.1-flash-free}"
 PROBE_INTERVAL="${PROBE_INTERVAL_SEC:-300}"
 MAX_RUN="${MAX_RUN_SEC:-13500}"
-CF_PROTOCOL="${CF_PROTOCOL:-quic}"
 
 PROBE_PAYLOAD="$(printf '{"model":"%s","messages":[{"role":"system","content":"You are opencode, a coding agent. Answer concisely."},{"role":"user","content":"用一句话说明你能做什么。"},{"role":"assistant","content":"我可以帮你读写代码、运行命令、排查问题。"},{"role":"user","content":"好，只回复：ok"}],"max_tokens":128,"stream":true}' "$PROBE_MODEL")"
 
@@ -107,13 +106,6 @@ stop_proc() {
 cleanup() {
   local rc=$?
   trap - EXIT
-  if [ -s "$CF_LOG" ]; then
-    local reg rec
-    reg="$(grep -c 'Registered tunnel connection' "$CF_LOG" 2>/dev/null || true)"
-    rec="$(grep -cE 'Connection terminated|Lost connection|Retrying' "$CF_LOG" 2>/dev/null || true)"
-    say "TUNNEL_SUM protocol=$CF_PROTOCOL reg=$reg reconnect=$rec"
-    grep -E 'Registered tunnel connection|Connection terminated|Lost connection|Retrying' "$CF_LOG" 2>/dev/null | tail -8 | while IFS= read -r l; do say "TUNNEL_LOG $l"; done
-  fi
   stop_proc "$CF_PID" cloudflared
   stop_proc "$GW_PID" gateway
   stop_proc "$WATCH_PID" log-watcher
@@ -178,7 +170,7 @@ wait_local_health() {
 start_tunnel() {
   : > "$CF_LOG"
   if [ -n "${CF_TUNNEL_TOKEN:-}" ] && [ "${CF_TUNNEL_TOKEN}" != "quick" ] && [ "${CF_TUNNEL_TOKEN}" != "none" ]; then
-    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --protocol "$CF_PROTOCOL" run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
+    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     if [ -n "${ZEN_PUBLIC_HOST:-}" ]; then PUBLIC_URL="https://$ZEN_PUBLIC_HOST"; fi
     say "named tunnel pid=$CF_PID host=${PUBLIC_URL:-<未设置 ZEN_PUBLIC_HOST>}"
@@ -198,7 +190,7 @@ start_tunnel() {
     fi
   else
     warn "没有 CF_TUNNEL_TOKEN，用临时隧道（URL 每次都会变）"
-    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --protocol "$CF_PROTOCOL" --url "http://127.0.0.1:$PORT" >>"$CF_LOG" 2>&1 &
+    "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info --url "http://127.0.0.1:$PORT" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     local i
     for i in $(seq 1 60); do
@@ -209,42 +201,6 @@ start_tunnel() {
     done
   fi
   if [ -n "$PUBLIC_URL" ]; then printf '%s\n' "$PUBLIC_URL" > "$RUN/public-url.txt"; fi
-}
-
-protocol_report() {
-  local line="" i
-  for i in $(seq 1 30); do
-    line="$(grep -m1 'Registered tunnel connection' "$CF_LOG" 2>/dev/null || true)"
-    [ -n "$line" ] && break
-    kill -0 "$CF_PID" 2>/dev/null || break
-    sleep 1
-  done
-  say "TUNNEL_CFG protocol=$CF_PROTOCOL"
-  if [ -n "$line" ]; then
-    say "TUNNEL_REG $line"
-  else
-    warn "TUNNEL_REG 30s 内没有注册行（protocol=$CF_PROTOCOL）"
-  fi
-}
-
-tunnel_selfcheck() {
-  [ -n "$PUBLIC_URL" ] || return 0
-  local code
-  code="$(http_code "$PUBLIC_URL/health" 10)"
-  if [ "$code" = "200" ]; then
-    tunnel_fail=0
-    return 0
-  fi
-  tunnel_fail=$((tunnel_fail + 1))
-  warn "公网自检 $code（连续 $tunnel_fail/3）"
-  if [ "$tunnel_fail" -ge 3 ]; then
-    warn "公网连续 3 次异常，重启 cloudflared（protocol=$CF_PROTOCOL）"
-    stop_proc "$CF_PID" cloudflared
-    start_tunnel
-    wait_public_health || true
-    protocol_report
-    tunnel_fail=0
-  fi
 }
 
 wait_public_health() {
@@ -316,7 +272,6 @@ fi
 # 隧道先起，和本地 chat 探针并行，省掉串行等待。
 start_tunnel
 watch_logs
-protocol_report
 
 # 优先执行本地真 chat 探针：验证网关 + WARP 出口是否真正拿到 200
 BOOT_BASE="http://127.0.0.1:$PORT"
@@ -379,18 +334,11 @@ fi
 note "IP 与出口验证完毕，启动耗时 ${SECONDS}s，开始服务"
 
 next_probe=$((SECONDS + PROBE_INTERVAL))
-next_tunnel_check=$((SECONDS + 60))
 gw_restarts=0
 cf_restarts=0
-tunnel_fail=0
 
 while :; do
   sleep 15
-
-  if [ "$SECONDS" -ge "$next_tunnel_check" ]; then
-    tunnel_selfcheck
-    next_tunnel_check=$((SECONDS + 60))
-  fi
 
   if [ -s "$REASON" ]; then
     reason_msg="$(head -c 200 "$REASON")"
