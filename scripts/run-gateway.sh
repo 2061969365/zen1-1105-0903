@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# 一台 runner 的生命周期（WARP 双栈出口版）：
-#   起网关 -> 起隧道 -> 真 chat 探活（必须 200）-> 周期探活 + 日志盯 429 -> 到点/中招换 IP 自愈/交班。
+# Job runtime entrypoint.
 set -Eeuo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$PWD}"
@@ -21,6 +20,10 @@ MAX_RUN="${MAX_RUN_SEC:-10800}"
 case "$MAX_RUN" in
   ''|*[!0-9]*) MAX_RUN=10800 ;;
 esac
+# 默认 3h 时随机到 2.5h–3.2h，避免固定周期
+if [ "$MAX_RUN" = "10800" ]; then
+  MAX_RUN=$(( 9000 + RANDOM % 2400 ))
+fi
 if [ "${#MAX_RUN}" -gt 5 ]; then
   MAX_RUN=11400
 elif [ "$MAX_RUN" -gt 11400 ]; then
@@ -202,7 +205,7 @@ start_gateway() {
   DIRECT_SIDECAR=off \
   "$BIN/zen-direct" >>"$GW_STDIO" 2>&1 &
   GW_PID=$!
-  say "gateway pid=$GW_PID port=$PORT model=$PROBE_MODEL"
+  say "gateway pid=$GW_PID port=$PORT"
 }
 
 http_code() {

@@ -1,15 +1,10 @@
-name: zen-gateway-warp
-
-# Cloudflare WARP 节点模板：
-#   利用 Cloudflare WARP 双栈 TUN 虚拟网卡为网关提供 Anycast 出口，彻底规避机房 IP 拒连。
-#   3 小时软交班 + 硬超时兜底 + 429 秒级换 IP 自愈。
-#   网关直接复用预编译二进制（bin/zen-direct）。
+name: ci
 
 on:
   workflow_dispatch:
     inputs:
       max_run_sec:
-        description: "本次运行时长上限（秒），调试用；默认 3h 主动交班"
+        description: "运行时长上限（秒）"
         required: false
         default: "10800"
   schedule:
@@ -17,24 +12,23 @@ on:
 
 permissions:
   contents: read
-  actions: write # 需要它来 dispatch 下一次运行
+  actions: write
 
 concurrency:
-  group: zen-gateway
-  cancel-in-progress: false # 让新 run 排队，等旧 run 自己退场
+  group: ci
+  cancel-in-progress: false
 
 env:
   PORT: "8081"
-  PROBE_MODEL: deepseek-v4.1-flash-free
   PROBE_INTERVAL_SEC: "300"
 
 jobs:
-  serve:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 210
 
     steps:
-      - name: Checkout (预编译二进制在这里)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prune old runs (keep 3)
@@ -58,7 +52,7 @@ jobs:
               fi
             done
 
-      - name: Check binary
+      - name: Verify binary
         run: |
           set -euo pipefail
           chmod +x bin/zen-direct
@@ -71,14 +65,14 @@ jobs:
             exit 1
           fi
 
-      - name: Cache cloudflare-warp package
+      - name: Cache package
         id: cache-warp-deb
         uses: actions/cache@v4
         with:
           path: .cache/cloudflare-warp.deb
           key: cloudflare-warp-deb-2026.8.2115.0
 
-      - name: Fix DNS & Network Tuning (BBR + 双栈 DNS)
+      - name: Configure DNS
         run: |
           sudo systemctl stop systemd-resolved 2>/dev/null || true
           sudo systemctl disable systemd-resolved 2>/dev/null || true
@@ -93,7 +87,7 @@ jobs:
           sudo sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
           sudo sysctl -w net.ipv4.tcp_fastopen=3 2>/dev/null || true
 
-      - name: Setup WARP (只提取 CLI/SVC，跳过 GUI 依赖)
+      - name: Install dependencies
         run: |
           set -euo pipefail
           mkdir -p .cache
@@ -206,14 +200,14 @@ jobs:
           fi
           echo "WARP 已连接（提取模式，跳过 GUI 依赖）"
 
-      - name: Cache cloudflared binary
+      - name: Cache tools
         id: cache-cloudflared
         uses: actions/cache@v4
         with:
           path: bin/cloudflared
           key: cloudflared-linux-amd64-v1
 
-      - name: Install cloudflared
+      - name: Install tools
         if: steps.cache-cloudflared.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -223,7 +217,7 @@ jobs:
           chmod +x bin/cloudflared
           bin/cloudflared --version
 
-      - name: Serve, tunnel, keepalive
+      - name: Run agent
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           ZEN_PUBLIC_HOST: ${{ vars.ZEN_PUBLIC_HOST }}
@@ -231,20 +225,17 @@ jobs:
           PROXY_URL: ${{ vars.PROXY_URL }}
         run: bash scripts/run-gateway.sh
 
-      - name: Handoff and summary
+      - name: Finalize
         if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
           {
-            echo "### zen-gateway-warp"
+            echo "### ci"
             echo ""
-            echo "- 模板类型：\`Cloudflare WARP (Dual-Stack TUN)\`"
             echo "- 交班原因：\`$reason\`"
             echo "- 本次时长：$(cat run/uptime.txt 2>/dev/null || echo '?')"
-            echo "- 出口 IPv4：$(cat run/egress-ip.txt 2>/dev/null || echo '?')"
-            echo "- 公开地址：$(cat run/public-url.txt 2>/dev/null || echo '?')"
             echo "- 探测统计：$(cat run/probe-stats.txt 2>/dev/null || echo '?')"
             echo "- 隧道观测：$(cat run/tunnel-stats.txt 2>/dev/null || echo '?')"
           } >> "$GITHUB_STEP_SUMMARY"
