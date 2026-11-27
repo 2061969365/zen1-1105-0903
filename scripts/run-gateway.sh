@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Job runtime entrypoint.
 set -Eeuo pipefail
 
 ROOT="${GITHUB_WORKSPACE:-$PWD}"
@@ -20,7 +19,6 @@ MAX_RUN="${MAX_RUN_SEC:-10800}"
 case "$MAX_RUN" in
   ''|*[!0-9]*) MAX_RUN=10800 ;;
 esac
-# 默认 3h 时随机到 2.5h–3.2h，避免固定周期
 if [ "$MAX_RUN" = "10800" ]; then
   MAX_RUN=$(( 9000 + RANDOM % 2400 ))
 fi
@@ -73,7 +71,7 @@ warp_wait_connected() {
 
 try_warp_refresh() {
   if command -v warp-cli >/dev/null 2>&1; then
-    say "WARP: 重新注册以获取全新 Cloudflare 设备身份与双栈出口..."
+    say "WARP: 重新注册..."
     timeout 30 sudo warp-cli --accept-tos disconnect 2>/dev/null || true
     timeout 30 sudo warp-cli --accept-tos registration delete 2>/dev/null || true
     sleep 0.5
@@ -90,7 +88,7 @@ try_warp_refresh() {
     local new_ip new_v6
     new_ip="$(curl -s4 --noproxy '*' --max-time 6 https://api.ipify.org 2>/dev/null || echo '?')"
     new_v6="$(curl -s6 --noproxy '*' --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none')"
-    say "WARP: 新设备注册完成，获得全新出口 IPv4=$new_ip IPv6=$new_v6"
+    say "WARP: 新设备注册完成"
     printf '%s %s\n' "$new_ip" "$new_v6" > "$RUN/egress-ip.txt"
     return 0
   fi
@@ -124,7 +122,6 @@ warp_selfcheck() {
   fi
 }
 
-# 记录初始出口 IP（IPv4/IPv6 并行探测，避免串行等待）
 ( curl -s4 --max-time 6 https://api.ipify.org 2>/dev/null || echo '?' ) > "$RUN/ip4.tmp" &
 p4=$!
 ( curl -s6 --max-time 6 https://api6.ipify.org 2>/dev/null || echo 'none' ) > "$RUN/ip6.tmp" &
@@ -135,7 +132,7 @@ curr_v6="$(cat "$RUN/ip6.tmp" 2>/dev/null || true)"
 [ -n "$curr_ip" ] || curr_ip='?'
 [ -n "$curr_v6" ] || curr_v6='none'
 printf '%s %s\n' "$curr_ip" "$curr_v6" > "$RUN/egress-ip.txt"
-say "WARP 初始出口 IPv4=$curr_ip IPv6=$curr_v6"
+say "WARP 初始出口已记录"
 
 stop_proc() {
   local pid="$1" name="$2" i
@@ -234,7 +231,7 @@ start_tunnel() {
     "$BIN/cloudflared" tunnel --no-autoupdate --loglevel info run --token "$CF_TUNNEL_TOKEN" >>"$CF_LOG" 2>&1 &
     CF_PID=$!
     if [ -n "${ZEN_PUBLIC_HOST:-}" ]; then PUBLIC_URL="https://$ZEN_PUBLIC_HOST"; fi
-    say "named tunnel pid=$CF_PID host=${PUBLIC_URL:-<未设置 ZEN_PUBLIC_HOST>}"
+    say "named tunnel pid=$CF_PID"
     if [ -z "$PUBLIC_URL" ]; then
       local j
       for j in $(seq 1 10); do
@@ -244,7 +241,7 @@ start_tunnel() {
         sleep 2
       done
       if [ -n "$PUBLIC_URL" ]; then
-        note "从隧道配置里读到域名：$PUBLIC_URL"
+        note "从隧道配置里读到域名"
       else
         warn "没设 ZEN_PUBLIC_HOST，也没从隧道配置里读到域名，公网自检将跳过"
       fi
@@ -265,7 +262,7 @@ start_tunnel() {
     done
     if [ -z "$PUBLIC_URL" ]; then
       warn "临时隧道 120s 内没拿到公网 URL，交班换 runner"
-      rotate "临时隧道未拿到公网 URL"
+      rotate "临时隧道未就绪"
     fi
   fi
   if [ -n "$PUBLIC_URL" ]; then printf '%s\n' "$PUBLIC_URL" > "$RUN/public-url.txt"; fi
@@ -293,9 +290,9 @@ tunnel_selfcheck() {
   if ! curl -s4 --noproxy '*' --max-time 5 https://api.ipify.org >/dev/null 2>&1 && \
      ! curl -s6 --noproxy '*' --max-time 5 https://api6.ipify.org >/dev/null 2>&1; then
     warp_egress_fails=$((warp_egress_fails + 1))
-    warn "公网自检失败且 WARP 出口不可用（连续 $warp_egress_fails/3）"
+    warn "公网自检失败且出口不可用（连续 $warp_egress_fails/3）"
     if [ "$warp_egress_fails" -ge 3 ]; then
-      rotate "WARP 出口持续不可用（连续 $warp_egress_fails 次）"
+      rotate "出口持续不可用（连续 $warp_egress_fails 次）"
     fi
     if [ $((SECONDS - last_warp_egress_refresh)) -ge 300 ]; then
       last_warp_egress_refresh=$SECONDS
@@ -330,7 +327,7 @@ wait_public_health() {
       return 1
     fi
     if [ "$(curl -s -o /dev/null -w '%{http_code}' --noproxy '*' --max-time 10 "$PUBLIC_URL/health" 2>/dev/null || true)" = "200" ]; then
-      note "公网已通：$PUBLIC_URL"
+      note "公网已通"
       return 0
     fi
     sleep 3
@@ -375,27 +372,20 @@ verdict() {
 }
 
 dump_boot_diag() {
-  say "--- 网关启动日志 ---"
-  head -6 "$GW_STDIO" 2>/dev/null | while IFS= read -r l; do say "gw| $l"; done
-  if [ -s "$RUN/probe.hdr" ]; then
-    say "--- 探针响应头 ---"
-    grep -iE '^(HTTP/|x-|cf-|retry-after)' "$RUN/probe.hdr" 2>/dev/null | head -8 | while IFS= read -r l; do say "hdr| $l"; done
-  fi
+  say "boot diagnostics: run/"
 }
 
-say "run start pid=$$ max=${MAX_RUN}s probe_interval=${PROBE_INTERVAL}s (WARP 模式)"
+say "run start pid=$$ max=${MAX_RUN}s probe_interval=${PROBE_INTERVAL}s"
 
 start_gateway
 if ! wait_local_health 60; then
-  tail -n 40 "$GW_LOG" 2>/dev/null || true
+  say "gateway log: run/gateway.log"
   rotate "本地 /health 60s 没起来"
 fi
 
-# 隧道先起，和本地 chat 探针并行，省掉串行等待。
 start_tunnel
 watch_logs
 
-# 优先执行本地真 chat 探针：验证网关 + WARP 出口是否真正拿到 200
 BOOT_BASE="http://127.0.0.1:$PORT"
 BOOT_TRIES=6
 boot_ok=0
@@ -410,7 +400,7 @@ while [ "$attempt" -lt "$BOOT_TRIES" ]; do
     ok) boot_ok=1; break ;;
     limit)
       if [ "$attempt" -lt "$BOOT_TRIES" ]; then
-        warn "WARP 出口命中 429，立即重新注册获取全新出口 IPv4 (第 $attempt/$BOOT_TRIES 次)..."
+        warn "WARP 出口命中 429，重新注册 (第 $attempt/$BOOT_TRIES 次)..."
         try_warp_refresh || true
         stop_proc "$GW_PID" gateway
         start_gateway
@@ -418,7 +408,7 @@ while [ "$attempt" -lt "$BOOT_TRIES" ]; do
         sleep 1
       else
         dump_boot_diag
-        rotate "起手本地探测 429（换 IP 试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
+        rotate "起手本地探测 429（试了 $BOOT_TRIES 次）：${PROBE_BODY:0:200}" fast
       fi
       ;;
     *)
@@ -437,7 +427,7 @@ ok_count=$((ok_count + 1))
 note "网关就绪（WARP 本地 chat 200），隧道已在后台启动"
 
 if [ -n "$PUBLIC_URL" ]; then
-  note "验证公网隧道：$PUBLIC_URL/health"
+  note "验证公网隧道"
   tunnel_ok=0
   t=0
   while [ "$t" -lt "$BOOT_TRIES" ]; do
@@ -448,14 +438,12 @@ if [ -n "$PUBLIC_URL" ]; then
     sleep 3
   done
   if [ "$tunnel_ok" = "1" ]; then
-    note "公网已通：$PUBLIC_URL"
+    note "公网已通"
   else
     warn "公网 /health 没回到 200（最后一次 $code），可能是新域名/回源解析中；本地 chat 200 已就绪，继续服务"
   fi
 fi
-note "IP 与出口验证完毕，启动耗时 ${SECONDS}s，开始服务"
-# 服务真正跑起来了（公网探活通过）才写这个标记：
-# workflow 用它判断"这次 run 有没有真的提供服务"，避免失败 run 无限互相拉起。
+note "验证完毕，启动耗时 ${SECONDS}s，开始服务"
 printf '%s\n' "$(date -u +%FT%TZ)" > "$RUN/serve-ok"
 
 

@@ -99,18 +99,12 @@ jobs:
               https://pkg.cloudflareclient.com/pool/noble/main/c/cloudflare-warp/cloudflare-warp_2026.8.2115.0_amd64.deb
           fi
 
-          # warp-svc 只需要这些运行库，不装 webkit/gtk GUI 依赖。
-          # 必需库：缺了 warp-svc 起不来。
           deps=(
             libdbus-1-3 libnss3 libpcap0.8
             iproute2 nftables libcap2-bin ca-certificates
           )
-          # 可选库：TPM 相关（TPM 透传/证明用）。取不到不影响 TUN 出口，
-          # 但 apt 拉包时 DNS 抖动会把整步带崩，所以单独装、失败只告警。
           optional_deps=(libtss2-esys-3.0.2-0t64 libtss2-tctildr0t64)
 
-          # Azure runner 的默认 DNS 偶尔解析失败，apt 会整体失败；
-          # 这里强制用公共 DNS + 重试，别让一次抖动废掉整个 run。
           resolve_ok=0
           for ns in 1.1.1.1 8.8.8.8 9.9.9.9; do
             sudo rm -f /etc/resolv.conf
@@ -157,7 +151,6 @@ jobs:
           sudo systemctl enable warp-svc >/dev/null 2>&1 || true
           sudo systemctl restart warp-svc
 
-          # 等 daemon socket 真正可用；systemctl is-active 不够，socket 可能还没建好。
           ready=0
           for i in $(seq 1 60); do
             if timeout 2 sudo warp-cli --accept-tos status >/dev/null 2>&1; then ready=1; break; fi
@@ -182,7 +175,6 @@ jobs:
           retry timeout 30 sudo warp-cli --accept-tos mode warp+doh
           retry timeout 30 sudo warp-cli --accept-tos connect
 
-          # connect 是异步的，必须等到真正 Connected 再做 DNS/网关。
           connected=0
           for i in $(seq 1 60); do
             st="$(timeout 2 sudo warp-cli --accept-tos status 2>&1 || true)"
@@ -230,7 +222,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          reason="$(cat run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
+          reason="$(sed -E 's#https?://[^ ]+#<redacted>#g; s#([0-9]{1,3}\.){3}[0-9]{1,3}#<redacted>#g' run/rotate.flag 2>/dev/null || echo '退出但没留原因（被硬超时或异常杀掉）')"
           {
             echo "### ci"
             echo ""
@@ -245,8 +237,6 @@ jobs:
             exit 0
           fi
 
-          # 服务一次都没真正跑起来（例如 setup 阶段就挂了）时不要再 dispatch：
-          # 否则每个失败的 run 都会拉起下一个 run，变成无限失败循环、白烧 Actions。
           if [ ! -f run/serve-ok ]; then
             echo "::error::本次 run 从未成功提供服务，停止自动交班（不再拉起下一个 run）"
             exit 0
